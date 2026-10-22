@@ -27,7 +27,11 @@ The feature endpoints accept `{ "text": "..." }`, except hello and evaluations, 
 
 [OpenAiController.cs](Controllers/OpenAiController.cs) contains the individual feature integrations. The explanation endpoint limits output to 512 tokens, disables stored output, and checks completion status and nonempty text before returning success. Its two-sentence instruction guides generation; C# does not enforce sentence count.
 
-Chat constructs a fresh message list for each request, with no persisted conversation history. Embeddings return vectors without implementing storage or similarity search. Moderation returns a safety signal; the ticket classifier demonstrates how that signal becomes an application decision.
+The feature endpoints demonstrate separate integration boundaries:
+
+- **Chat:** creates a fresh message list per request, with no persisted history.
+- **Embeddings:** returns vectors; storage and similarity search remain application work.
+- **Moderation:** returns a safety signal; the ticket classifier shows how to enforce it.
 
 ### Streaming and the HTTP lifecycle
 
@@ -59,15 +63,196 @@ Estimated cost combines uncached input, cached input, and output token counts wi
 
 A singleton `RequestGateFilter` uses `SemaphoreSlim` to serialize classifications and complete evaluation runs. Holding the gate for the entire suite keeps per-case cost differences isolated from concurrent requests.
 
-Accounting is held in memory, resets on restart, and is not coordinated across replicas. Restarting does not reconcile unknown upstream usage. The limits apply only to classification and its evaluations; other feature endpoints are outside this accounting. A request can exceed the soft budget, so the estimate is not a guaranteed billing cap.
+Accounting has several limits:
+
+- State lives in memory, resets on restart, and is not shared across replicas.
+- Restarting does not reconcile unknown upstream usage.
+- Only classification and its evaluations use this accounting.
+- A request can exceed the soft budget; the estimate is not a guaranteed billing cap.
 
 Middleware maps failures to HTTP problem responses without exposing raw SDK exception bodies. Invalid ticket input returns `400`, flagged input returns `422`, rejected output or upstream failures can return `502`, unavailable accounting or limits return `503`, and classification timeouts return `504`.
+
+## OpenAI SDK methods, parameters, and setup
+
+This reference covers the OpenAI package calls used in this repository, pinned to **2.14.0** in [OpenAiBasicsApi.csproj](OpenAiBasicsApi.csproj). Start with the client setup, then follow the method used by the endpoint you want to explore. The [official OpenAI SDK documentation](https://developers.openai.com/api/docs/libraries) provides installation guidance; the examples below match this checkout's SDK and code.
+
+### Client setup and model selection
+
+[Program.cs](Program.cs) constructs one root client and registers its feature clients as singletons:
+
+```csharp
+new OpenAIClient(new ApiKeyCredential(key), new OpenAIClientOptions
+{
+    RetryPolicy = new ClientRetryPolicy(maxRetries: 0)
+});
+```
+
+The setup fields control authentication and transport:
+
+- **Credential:** `ApiKeyCredential(key)` supplies the key read through `IConfiguration`.
+- **Options:** `OpenAIClientOptions.RetryPolicy` controls automatic retries. `maxRetries: 0` disables them, making attempts easier to account for.
+- **Supporting types:** `ApiKeyCredential` and `ClientRetryPolicy` come from `System.ClientModel`.
+
+Constructing clients does not generate output or preserve conversation history.
+
+| Factory method | Parameters used here | Purpose and use case |
+| --- | --- | --- |
+| `GetResponsesClient()` | None. Each generation request supplies its model. | Obtain the client for hello, explanations, streaming, and ticket classification. |
+| `GetChatClient(chatModel)` | `model`: `OPENAI_CHAT_MODEL`, falling back to the main model. | Obtain a Chat Completions client for role-based messages. The model is selected when the client is created. |
+| `GetEmbeddingClient("text-embedding-3-small")` | `model`: the hardcoded embedding model name. | Obtain the client for turning text into vectors for similarity-based applications. |
+| `GetModerationClient("omni-moderation-latest")` | `model`: the hardcoded moderation model name. | Obtain the client for content safety classification. |
+
+See [Running locally](#running-locally) for configuration values and defaults:
+
+- `OPENAI_*` keys configure this application; they are not SDK request properties.
+- Embedding and moderation models are hardcoded and require code changes to override.
+- Token rates support local classification estimates and are not sent to OpenAI.
+
+### `ResponseItem.CreateUserMessageItem(text)` — build user input
+
+This local factory wraps a string as a Responses API user message. It does not call the service. Explanations and classification pass the resulting item in the collection supplied to `new CreateResponseOptions(model, inputItems)`.
+
+Use this to keep user content separate from application instructions. In classification, `text` is the untrusted ticket; the classification rules go into `Instructions`. That separation supports the prompt's intent, while the C# allowlist checks the returned label.
+
+### `ResponsesClient.CreateResponseAsync(...)` — generate a complete result
+
+Use a buffered response when the application needs the complete answer before returning HTTP success, such as a short explanation or a validated ticket label. The repository uses two overloads:
+
+```csharp
+// HelloController: model and a plain-text prompt.
+ResponseResult response = await responses.CreateResponseAsync(
+    model, "Explain async/await in one sentence.", cancellationToken: ct);
+
+// OpenAiController and TicketClassifier: explicit request options.
+var options = new CreateResponseOptions(model,
+    [ResponseItem.CreateUserMessageItem(text)])
+{
+    Instructions = "Explain the user's topic in two simple sentences.",
+    MaxOutputTokenCount = 512,
+    StoredOutputEnabled = false
+};
+ResponseResult explanation = await responses.CreateResponseAsync(options, ct);
+```
+
+| Parameter or option | Value used here | Meaning |
+| --- | --- | --- |
+| `model` | Main configured model; see setup for fallbacks. | Selects the generation model for this request. |
+| Plain-text prompt / input items | Fixed hello prompt, user topic, or ticket text. | Supplies the material the model responds to. The options constructor receives the user-message collection. |
+| `Instructions` | Two-sentence explanation instruction or the classifier's fixed rules. | Supplies application instructions separately from user input. Sentence count is guided by the prompt rather than enforced in C#. |
+| `MaxOutputTokenCount` | `512` on explanations, streaming, and classification. | Limits output tokens, including reasoning tokens where applicable; this is not a character limit or a total request-cost cap. |
+| `StoredOutputEnabled` | `false` on those explicit options. | Disables storing the response for later API retrieval. This setting alone is not a guarantee about all service data retention. |
+| `cancellationToken` / positional `ct` | HTTP request token; linked 45-second timeout token in classification. | Allows cancellation of the asynchronous operation. Cancellation does not establish that upstream work incurred no usage. |
+
+Hello uses the short overload and does not explicitly set instructions, output-token limits, or storage behavior. For the full explanation and classifier flows, inspect `ResponseResult.Status` before accepting output. `ResponseStatus.Completed` indicates completion; it does not establish that the answer is correct.
+
+### `ResponseResult.GetOutputText()` — extract generated text
+
+This helper takes no parameters and extracts text from the returned response. It performs no additional API request. [HelloController.cs](Controllers/HelloController.cs) returns that text directly; [OpenAiController.cs](Controllers/OpenAiController.cs) rejects empty explanation text; [TicketClassifier.cs](TicketClassifier.cs) trims the text and validates it against the three allowed labels.
+
+Use it when your endpoint needs a string rather than the full response object. Extraction alone does not validate completion, handle a refusal as a domain result, or enforce an output contract.
+
+`ResponseResult.Usage` is a property, not another SDK call. The code reads these fields for reporting and accounting:
+
+| Field | Meaning in this application |
+| --- | --- |
+| `InputTokenCount` | Total reported input tokens, including the cached subset. |
+| `InputTokenDetails?.CachedTokenCount` | Cached input tokens, charged at the configured cached rate in the local estimate; missing details default to zero. |
+| `OutputTokenCount` | Reported output tokens used for output-cost estimation. |
+| `OutputTokenDetails?.ReasoningTokenCount` | Reasoning-token subset reported for visibility; missing details default to zero. It is not added again to the output-cost calculation. |
+
+The explanation endpoint can return `usage: null`. Classification stops further generation if usage is missing or unknown. Its estimate is `((input - cached) × inputRate + cached × cachedRate + output × outputRate) / 1,000,000`.
+
+### `ResponsesClient.CreateResponseStreamingAsync(options, ct)` — receive incremental output
+
+Use streaming to display a longer explanation as it arrives. Parameters are the same request options and cancellation token used for buffered explanations, with `StreamingEnabled = true` in the streaming action.
+
+```csharp
+await foreach (StreamingResponseUpdate update in
+    responses.CreateResponseStreamingAsync(options, ct))
+{
+    if (update is StreamingResponseOutputTextDeltaUpdate delta)
+    {
+        await Response.WriteAsync(delta.Delta, ct);
+        await Response.Body.FlushAsync(ct);
+    }
+}
+```
+
+The method returns an asynchronous sequence of updates:
+
+- The controller forwards only text fragments from `StreamingResponseOutputTextDeltaUpdate.Delta`.
+- `WriteAsync` and `FlushAsync` are ASP.NET Core/.NET methods that send and flush the text.
+- The endpoint omits final usage reporting and the buffered endpoint's completion and nonempty-output checks.
+
+Try the existing streaming request with `curl -N` from [Example requests](#example-requests), and compare its incremental plain-text output with the buffered explanation's JSON response. Both requests call the service and can incur usage.
+
+### `ChatClient.CompleteChatAsync(messages, cancellationToken: ct)` — answer role-based messages
+
+Use Chat Completions when integrating a message-list workflow. [OpenAiController.cs](Controllers/OpenAiController.cs) sends:
+
+```csharp
+var result = await chat.CompleteChatAsync(
+    [new SystemChatMessage("You are a concise support assistant."),
+     new UserChatMessage(text)], cancellationToken: ct);
+```
+
+The parameters and message constructors serve these roles:
+
+- **`messages`:** conversation supplied for this call.
+- **`SystemChatMessage(instruction)`:** builds a local message containing application instructions.
+- **`UserChatMessage(text)`:** builds a local message containing user input.
+- **`ChatCompletionOptions`:** optional and omitted here; no per-call output-token limit is configured.
+- **`cancellationToken`:** propagates HTTP cancellation.
+
+The model comes from `GetChatClient(chatModel)`.
+
+The result wrapper's `Value` contains a `ChatCompletion`. The controller concatenates `reply.Content` text parts and rejects missing or empty text. Each request starts with a fresh two-message list; a conversation across requests would require storing and resending history.
+
+### `EmbeddingClient.GenerateEmbeddingAsync(input, cancellationToken: ct)` and `OpenAIEmbedding.ToFloats()` — obtain a vector
+
+Use embeddings as input to semantic search, document similarity, or clustering. `input` is the validated text string; the optional `EmbeddingGenerationOptions` argument is omitted, and `cancellationToken` propagates HTTP cancellation. The model comes from `GetEmbeddingClient(...)`.
+
+```csharp
+OpenAIEmbedding embedding = await embeddings.GenerateEmbeddingAsync(
+    text, cancellationToken: ct);
+float[] vector = embedding.ToFloats().ToArray();
+```
+
+Each step has a separate role:
+
+- **`GenerateEmbeddingAsync(...)`:** calls the service and returns an embedding.
+- **`ToFloats()`:** takes no parameters and exposes the vector as `ReadOnlyMemory<float>` locally.
+- **`ToArray()`:** converts that memory to an array for the JSON response using .NET.
+
+Storing vectors, comparing them, and retrieving documents remain application work.
+
+### `ModerationClient.ClassifyTextAsync(text, ct)` — obtain a safety classification
+
+Use moderation before accepting or processing user content. The first parameter is the text to classify, and the second is the cancellation token. The model comes from `GetModerationClient(...)`; no additional moderation options are supplied here.
+
+```csharp
+ModerationResult result = await moderation.ClassifyTextAsync(text, ct);
+bool flagged = result.Flagged;
+```
+
+`Flagged` is a result property used in two ways:
+
+- **Moderation endpoint:** returns a `flagged` boolean for the caller to act on.
+- **Ticket classifier:** throws `input_moderation` for flagged input, preventing generation.
+
+Try the existing moderation and classification requests in [OpenAiBasicsApi.http](OpenAiBasicsApi.http) to inspect their different response contracts. Its empty-ticket request exercises local validation and returns `400` without making an upstream call.
 
 ## Local behavioral evaluations
 
 [Evals.cs](Evals.cs) defines six cases covering billing, a technical issue, an acknowledgement message, prompt injection, empty input, and oversized input. The suite calls the classifier directly and does not use the hosted Evals API.
 
-Reports include pass rate, per-case latency and estimated cost, cost per passing case, and model, prompt, SDK, and dataset versions. Infrastructure or accounting failures abort the run instead of counting as expected guardrail rejections.
+Reports include:
+
+- Pass rate and cost per passing case.
+- Per-case latency and estimated cost.
+- Model, prompt, SDK, and dataset versions.
+
+Infrastructure or accounting failures abort the run rather than count as expected guardrail rejections.
 
 Four cases can call upstream services; empty and oversized inputs fail locally. Evaluations incur API usage and share the classifier's attempt and budget limits. These cases provide a small regression baseline, not comprehensive evidence of classification accuracy.
 
