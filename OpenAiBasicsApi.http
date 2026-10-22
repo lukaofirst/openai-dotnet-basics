@@ -1,0 +1,75 @@
+# Matches the HTTP launch profile. Use http://localhost:5080 for the guide's launch command.
+@OpenAiBasicsApi_HostAddress = http://localhost:5164
+
+### Hello
+POST {{OpenAiBasicsApi_HostAddress}}/api/hello
+Accept: application/json
+
+### Generate an explanation
+POST {{OpenAiBasicsApi_HostAddress}}/api/openai/explanations
+Accept: application/json
+Content-Type: application/json
+
+{
+  "text": "Explain async/await."
+}
+
+### Stream an explanation (plain text chunks)
+POST {{OpenAiBasicsApi_HostAddress}}/api/openai/explanations/stream
+Accept: text/plain
+Content-Type: application/json
+
+{
+  "text": "Explain async/await."
+}
+
+### Chat
+POST {{OpenAiBasicsApi_HostAddress}}/api/openai/chat
+Accept: application/json
+Content-Type: application/json
+
+{
+  "text": "Explain dependency injection."
+}
+
+### Generate an embedding
+POST {{OpenAiBasicsApi_HostAddress}}/api/openai/embeddings
+Accept: application/json
+Content-Type: application/json
+
+{
+  "text": "A guide to asynchronous programming."
+}
+
+### Moderate text
+POST {{OpenAiBasicsApi_HostAddress}}/api/openai/moderation
+Accept: application/json
+Content-Type: application/json
+
+{
+  "text": "Thanks for helping me solve this problem."
+}
+
+### Classify a support ticket
+POST {{OpenAiBasicsApi_HostAddress}}/api/tickets/classify
+Accept: application/json
+Content-Type: application/json
+
+{
+  "text": "I was charged twice."
+}
+
+### Reject empty input (expected: 400, empty_input; no upstream call)
+POST {{OpenAiBasicsApi_HostAddress}}/api/tickets/classify
+Accept: application/json
+Content-Type: application/json
+
+{
+  "text": " "
+}
+
+### Run the local evaluation suite (Development only; shares classification limits)
+POST {{OpenAiBasicsApi_HostAddress}}/api/evals
+Accept: application/json
+
+###
